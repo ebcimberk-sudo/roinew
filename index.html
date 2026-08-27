@@ -2130,11 +2130,27 @@ function renderEventsTab(main){
 
   const fst = getForwardSalesTotals();
   const filteredSummaryEvents = getFilteredEvents();
-  const filteredAttendees = sum(filteredSummaryEvents, e=>e.AttendingCompanies||0);
-  const filteredPreTerms = sum(filteredSummaryEvents, e=>e.PreEventTermsSigned||0);
-  const filteredPostTerms = sum(filteredSummaryEvents, e=>e.CompaniesSigningTerms||0);
-  const filteredPlacements = sum(filteredSummaryEvents, e=>e.ApprovedPlacements||0);
-  const filteredFSR = round2(sum(filteredSummaryEvents, e=>e.ForwardSalesRevenueTotal||0));
+  const f2 = STATE.t2filters;
+  // When a specific Company is selected, the summary bar must reflect that company's own
+  // attributed totals (matching the company's figures shown on the Executive tab), not the
+  // combined totals of every event the company happened to attend. Event-level totals include
+  // Forward Sales Revenue attributed to OTHER companies whose first event was the same event.
+  let filteredAttendees, filteredPreTerms, filteredPostTerms, filteredPlacements, filteredFSR;
+  if(f2.company){
+    const c = DATA.companies.find(x=>x.CanonicalCompany===f2.company);
+    const firstEventIncluded = !!c && filteredSummaryEvents.some(e=>e.EventName===c.FirstEventName && e.EventDate===c.FirstEventDate);
+    filteredAttendees = c ? 1 : 0;
+    filteredPreTerms = (c && firstEventIncluded) ? (c.TermsBeforeEvent||0) : 0;
+    filteredPostTerms = (c && firstEventIncluded) ? (c.TermsAfterEvent||0) : 0;
+    filteredPlacements = (c && firstEventIncluded) ? (c.ApprovedPlacementsAfterEvent||0) : 0;
+    filteredFSR = (c && firstEventIncluded) ? round2(c.ForwardSalesRevenueTotal||0) : 0;
+  } else {
+    filteredAttendees = sum(filteredSummaryEvents, e=>e.AttendingCompanies||0);
+    filteredPreTerms = sum(filteredSummaryEvents, e=>e.PreEventTermsSigned||0);
+    filteredPostTerms = sum(filteredSummaryEvents, e=>e.CompaniesSigningTerms||0);
+    filteredPlacements = sum(filteredSummaryEvents, e=>e.ApprovedPlacements||0);
+    filteredFSR = round2(sum(filteredSummaryEvents, e=>e.ForwardSalesRevenueTotal||0));
+  }
   main.innerHTML = `
     <h1 class="section-title">Events &amp; Companies</h1>
     <p class="section-desc">Every event shows all valid company names recorded in the Events Master. Event-card term counts are attendee-level; jobs, placements and Forward Sales Revenue remain first-event attributed. Use Event From / Event To to show only events that took place inside that date range. The date range filters the event date itself — it does not pull older events into a later period because they generated later activity.</p>
