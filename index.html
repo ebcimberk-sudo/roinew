@@ -1263,70 +1263,67 @@ function processContract(pl, FX, latestFX, HOL, cutoffDate, missingData){
     // A contract that has not yet started keeps its full scheduled margin in Future
     // Contract Margin until a later cutoff passes the Start Date.
     const contractStarted = !!r._startDate && r._startDate <= cutoffDate;
-    const actualByMonth = {}, futureByMonth = {};
+
+    // Contract FX rule: since the full contract value is now counted once rather than
+    // recognised month by month, it is converted using ONE rate - the FX rate for the
+    // month the contract's Start Date falls in - applied to the whole scheduled margin.
+    // This avoids needing a published rate for every month a multi-year contract might
+    // run through, and avoids silently excluding value just because a later calendar
+    // month's rate hasn't been entered yet. The monthly working-day breakdown below is
+    // retained for audit visibility only; it no longer drives separate per-month FX.
+    const byMonthDays = {};
     own.forEach(dk=>{
       const d = dateFromKey(dk);
       const ym = `${d.getUTCFullYear()}-${d.getUTCMonth()+1}`;
-      if(contractStarted) actualByMonth[ym] = (actualByMonth[ym]||0)+perDayRate;
-      else futureByMonth[ym] = (futureByMonth[ym]||0)+perDayRate;
+      byMonthDays[ym] = (byMonthDays[ym]||0)+1;
     });
+    const totalOriginal = own.size * perDayRate;
 
     const revenueApplies = approved && r._attributed;
-    let actualGBP=0, futureGBP=0;
-    let usedActualFX=false, usedFallbackFX=false, fxRateSample=null;
-    const allMonths = [...new Set([...Object.keys(actualByMonth), ...Object.keys(futureByMonth)])];
-    allMonths.forEach(ym=>{
-      const [y,mo] = ym.split('-').map(Number);
-      const amtActual = actualByMonth[ym]||0, amtFuture = futureByMonth[ym]||0;
-      const elig = [...own].filter(dk=>{ const d=dateFromKey(dk); return d.getUTCFullYear()===y && d.getUTCMonth()+1===mo; }).length;
-      let rate = fxRate(FX, y, mo, ccy);
-      let fxSourceMonth = ccy==='GBP' ? 'GBP - no conversion needed' : (rate!==null ? 'Actual monthly FX' : null);
-      let gbpActual=0, gbpFuture=0;
-      if(revenueApplies){
-        if(rate===null){
-          if(amtActual>0){
-            missingData.push(mkFlag('Critical','Placements', pid, '', r._canonCompany, 'Missing FX rate for contract revenue month',
-              `FX Rates ${y}-${String(mo).padStart(2,'0')} ${ccy}`, `${ccy} ${amtActual.toFixed(2)} excluded from confirmed GBP actual revenue`, 'Provide FX rate for that month'));
-          }
-          if(amtFuture>0){
-            // Future non-GBP contract margin: use the latest available FX rate at/before the
-            // reporting cutoff rather than leaving this unconverted. Never fabricate a future rate.
-            const fb = latestFXFor(latestFX, ccy);
-            if(fb){
-              rate = fb.rate;
-              fxSourceMonth = `Latest FX at cutoff (${fb.year}-${String(fb.month).padStart(2,'0')}, estimated)`;
-              gbpFuture = amtFuture*rate; futureGBP += gbpFuture;
-              usedFallbackFX = true; fxRateSample = rate;
-              missingData.push(mkFlag('Information','Placements', pid, '', r._canonCompany,
-                'Future non-GBP contract margin estimated using latest available FX at cutoff', `FX Rates ${y}-${String(mo).padStart(2,'0')} ${ccy}`,
-                `${ccy} ${amtFuture.toFixed(2)} converted using the latest available FX rate (${rate}, from ${fb.year}-${String(fb.month).padStart(2,'0')}) since the exact month's rate does not exist yet`,
-                'No action needed - will use the actual monthly FX rate once it becomes available'));
-            } else {
-              missingData.push(mkFlag('Critical','Placements', pid, '', r._canonCompany,
-                'Missing FX rate for future contract revenue month - no fallback rate available', `FX Rates ${y}-${String(mo).padStart(2,'0')} ${ccy}`,
-                `${ccy} ${amtFuture.toFixed(2)} excluded - no FX rate has ever been supplied for this currency`, 'Provide any FX rate for this currency'));
-            }
-          }
-        } else {
-          gbpActual = amtActual*rate; gbpFuture = amtFuture*rate; actualGBP += gbpActual; futureGBP += gbpFuture;
-          if(amtActual>0 || amtFuture>0){ usedActualFX = true; fxRateSample = rate; }
-        }
-      }
-      monthlyRows.push({ PlacementID:pid, CanonicalCompany:r._canonCompany, Candidate:r['Candidate'], Month:`${y}-${String(mo).padStart(2,'0')}`,
-        EligibleWorkingDays:elig, DailyMargin:round2(perDayRate), OriginalCurrencyRevenue:round2(amtActual+amtFuture), Currency:ccy,
-        MonthlyFXRate:rate, GBPRevenue: revenueApplies ? round2(gbpActual+gbpFuture) : 0, ActualOrFuture: amtActual>0?'Actual':'Future',
-        FXSource: fxSourceMonth || 'Missing' });
-    });
+    let actualGBP=0, futureGBP=0, fxSource=null, fxRateUsed=null;
 
-    const fxSource = ccy==='GBP' ? 'GBP - no conversion needed'
-      : (usedFallbackFX && usedActualFX) ? 'Mixed (actual monthly + latest-cutoff estimate)'
-      : usedFallbackFX ? 'Latest FX at cutoff (estimated)'
-      : usedActualFX ? 'Actual monthly FX'
-      : (revenueApplies ? 'Missing FX' : null);
+    if(revenueApplies && r._startDate){
+      const sy = r._startDate.getUTCFullYear(), sm = r._startDate.getUTCMonth()+1;
+      let rate = fxRate(FX, sy, sm, ccy);
+      const startMonthLabel = `${sy}-${String(sm).padStart(2,'0')}`;
+      if(rate===null){
+        // Start Date month's rate isn't published yet - use the latest available rate
+        // rather than leaving the whole contract unconverted, and flag it as an estimate.
+        const fb = latestFXFor(latestFX, ccy);
+        if(fb){
+          rate = fb.rate;
+          fxSource = `Latest FX at cutoff (${fb.year}-${String(fb.month).padStart(2,'0')}, estimated - Start Date month ${startMonthLabel} not yet published)`;
+          missingData.push(mkFlag('Information','Placements', pid, '', r._canonCompany,
+            'Contract Start Date month FX not yet published - used latest available rate', `FX Rates ${startMonthLabel} ${ccy}`,
+            `${ccy} ${totalOriginal.toFixed(2)} converted using the latest available FX rate (${rate}, from ${fb.year}-${String(fb.month).padStart(2,'0')}) since ${startMonthLabel}'s rate does not exist yet`,
+            'No action needed - will use the Start Date month rate once it becomes available'));
+        } else {
+          missingData.push(mkFlag('Critical','Placements', pid, '', r._canonCompany, 'Missing FX rate for contract Start Date month',
+            `FX Rates ${startMonthLabel} ${ccy}`, `${ccy} ${totalOriginal.toFixed(2)} excluded from confirmed GBP Forward Sales Revenue`, 'Provide FX rate for the Start Date month'));
+          fxSource = 'Missing';
+        }
+      } else {
+        fxSource = ccy==='GBP' ? 'GBP - no conversion needed' : `Start Date month FX (${startMonthLabel}), applied to full contract value`;
+      }
+      if(rate!==null){
+        const gbpTotal = round2(totalOriginal * rate);
+        fxRateUsed = rate;
+        if(contractStarted) actualGBP = gbpTotal; else futureGBP = gbpTotal;
+      }
+    }
+
+    Object.entries(byMonthDays).sort().forEach(([ym,days])=>{
+      const [y,mo] = ym.split('-').map(Number);
+      const amtOriginal = days*perDayRate;
+      monthlyRows.push({ PlacementID:pid, CanonicalCompany:r._canonCompany, Candidate:r['Candidate'], Month:`${y}-${String(mo).padStart(2,'0')}`,
+        EligibleWorkingDays:days, DailyMargin:round2(perDayRate), OriginalCurrencyRevenue:round2(amtOriginal), Currency:ccy,
+        MonthlyFXRate:fxRateUsed, GBPRevenue: revenueApplies ? round2(amtOriginal*(fxRateUsed||0)) : 0, ActualOrFuture: contractStarted?'Actual':'Future',
+        FXSource: fxSource || 'Missing' });
+    });
 
     results.push({ row:r, actualGBP:round2(actualGBP), futureGBP:round2(futureGBP), calcStatus: actualGBP>0||futureGBP>0 ? 'Calculated' : (approved && r._attributed ? 'Calculated - £0' : 'Excluded'),
       calcStart: m.calcStart, calcEndActual: m.calcEndActual, scheduledWorkingDays: m.scheduledWorkingDays, holidaysRemoved: m.holidaysRemoved,
-      overlapDaysRemoved: overlapDaysRemoved[pid]||0, unitType: unit, hoursPerDay, fxSource, fxRateUsed: fxRateSample, currency: ccy });
+      overlapDaysRemoved: overlapDaysRemoved[pid]||0, unitType: unit, hoursPerDay, fxSource, fxRateUsed, currency: ccy });
   });
 
   Object.entries(meta).filter(([pid,m])=>!m.eligible).forEach(([pid,m])=>{
