@@ -314,7 +314,7 @@ function extractFromAuditWorkbook(wb){
 function aggregateForDashboard(sheets){
   const { calcSummary, mappingValidation, revenueByYearRaw, placementAudit, jobsAudit, eventAttrRaw,
     lateCRM, unmappedCompanies, missingData, acceptanceTests, termsPostEvent, placeholderRows, attendance,
-    activity, monthlyRows } = sheets;
+    activity, monthlyRows, contractBlocks } = sheets;
 
   const hasHostFormat = eventAttrRaw.length && ('Host' in eventAttrRaw[0]) && ('EventFormat' in eventAttrRaw[0]);
 
@@ -405,7 +405,8 @@ function aggregateForDashboard(sheets){
 
   // FORWARD SALES REVENUE: the approved-placement value already accrued to the
   // reporting cutoff for a company's relationship with events - permanent fees
-  // for placements that have started, plus contract margin earned to date. This
+  // for placements that have started, plus six-month contract blocks whose block
+  // start dates are on or before the cutoff. This
   // does NOT include future/not-yet-started value, since that hasn't happened
   // yet. It is grouped by the company's FIRST EVENT YEAR, never by placement
   // start year, contract month, or invoice date. This is still NOT
@@ -581,7 +582,7 @@ function aggregateForDashboard(sheets){
     locked, revenueByYear, revenueByFirstEventYear, companies, events, hosts, validationSummary,
     mappingValidation, acceptanceTests, missingData, lateCRM, unmappedCompanies, placeholderRows,
     activity: activity || { terms:[], allTerms:[], jobs:[], placements:[] },
-    placementAudit: placementAudit || [], contractMonthly: monthlyRows || [],
+    placementAudit: placementAudit || [], contractMonthly: monthlyRows || [], contractBlocks: contractBlocks || [],
   };
 }
 
@@ -590,9 +591,10 @@ function aggregateForDashboard(sheets){
 // RAW SOURCE ENGINE — implements the final LOCKED Phase 1 rules:
 // - Complete Canonical Mapping (one row per canonical company,
 //   newline-separated aliases, Include in Event Attribution, Status)
-// - Placement attribution: Date Added >= First Event Date
-// - Contract calc-start: MAX(Start Date, First Event Date) — Date
-//   Added excluded, late-CRM-entry Warning where Start < Date Added
+// - Placement attribution: Date Added >= First Event Date AND Start Date >= First Event Date
+// - Contract blocks: consecutive six-month periods anchored to Start Date;
+//   each block is recognised on its own start date
+// - Contract FX: block-start month rate; future missing rates use latest FX at cutoff
 // - No Audience Group inference (field doesn't exist at source)
 // - Event Format from explicit Event Type field only
 // ============================================================
@@ -625,6 +627,14 @@ function toDateOnly(d){
 function dateKey(d){ return d ? d.toISOString().slice(0,10) : null; }
 function dateFromKey(k){ if(!k) return null; const [y,m,day]=k.split('-').map(Number); return new Date(Date.UTC(y,m-1,day)); }
 function addDays(d,n){ const r=new Date(d); r.setUTCDate(r.getUTCDate()+n); return r; }
+function addMonthsClamped(d,n){
+  // Preserve the calendar-day anchor where possible and clamp month-end dates
+  // (for example 31 August + 6 months becomes 28/29 February, never March).
+  const y=d.getUTCFullYear(), m=d.getUTCMonth(), day=d.getUTCDate();
+  const first=new Date(Date.UTC(y,m+n,1));
+  const lastDay=new Date(Date.UTC(first.getUTCFullYear(),first.getUTCMonth()+1,0)).getUTCDate();
+  return new Date(Date.UTC(first.getUTCFullYear(),first.getUTCMonth(),Math.min(day,lastDay)));
+}
 function isWeekday(d){ const wd=d.getUTCDay(); return wd!==0 && wd!==6; }
 
 function readSheet(wb, name, opts){
@@ -1090,10 +1100,24 @@ function processPlacementsBase(rawRows, canon, companyStatus, firstEvent, cutoff
       'Placement cannot be attributed to any event', 'Record kept visible but excluded from event-attributed totals'));
   });
 
-  // LOCKED: attribution via Date Added
+  // Placement revenue requires both the CRM placement record and the candidate's
+  // actual start to be on/after the client's first event. If the candidate had
+  // already started before that first event, the whole placement (including any
+  // later six-month contract blocks) is excluded from event revenue.
   rows.forEach(r=>{
-    r._attributed = !!r._firstEventDate && !!r._dateAdded && r._dateAdded >= r._firstEventDate;
-    r._isPreEvent = !!r._firstEventDate && !!r._dateAdded && r._dateAdded < r._firstEventDate;
+    const addedAfterEvent = !!r._firstEventDate && !!r._dateAdded && r._dateAdded >= r._firstEventDate;
+    const startedAfterEvent = !!r._firstEventDate && !!r._startDate && r._startDate >= r._firstEventDate;
+    r._attributed = addedAfterEvent && startedAfterEvent;
+    r._isPreEvent = !!r._firstEventDate && (
+      (!!r._dateAdded && r._dateAdded < r._firstEventDate) ||
+      (!!r._startDate && r._startDate < r._firstEventDate)
+    );
+  });
+  rows.filter(r=>r._firstEventDate && r._startDate && r._startDate < r._firstEventDate).forEach(r=>{
+    missingData.push(mkFlag('Information','Placements', r['Placement ID'], r['Candidate']||'', r._canonCompany,
+      "Placement started before client's first event - excluded", 'Start Date / First Event Date',
+      `Start Date ${dateKey(r._startDate)} is before first event ${dateKey(r._firstEventDate)}; the placement and every later six-month block contribute £0 event revenue`,
+      'None - expected first-event attribution exclusion'));
   });
   rows.filter(r=>r['Status']!=='Approved').forEach(r=>{
     missingData.push(mkFlag('Information','Placements', r['Placement ID'], '', r._canonCompany, 'Non-Approved placement - £0 revenue',
@@ -1103,8 +1127,9 @@ function processPlacementsBase(rawRows, canon, companyStatus, firstEvent, cutoff
   // late CRM entry: Start Date before Date Added
   rows.filter(r=>r._startDate && r._dateAdded && r._startDate < r._dateAdded).forEach(r=>{
     const days = Math.round((r._dateAdded-r._startDate)/86400000);
+    const startedBeforeEvent = !!r._firstEventDate && r._startDate < r._firstEventDate;
     missingData.push(mkFlag('Warning','Placements', r['Placement ID'], '', r._canonCompany, 'Late CRM entry - Start Date before Date Added',
-      'Start Date / Date Added', `Start Date ${dateKey(r._startDate)} precedes Date Added ${dateKey(r._dateAdded)} by ${days} days - revenue still recognised from Start Date`,
+      'Start Date / Date Added', `Start Date ${dateKey(r._startDate)} precedes Date Added ${dateKey(r._dateAdded)} by ${days} days - ${startedBeforeEvent?'placement excluded because it started before the first event':'eligible revenue follows the Start Date/block-start rules'}`,
       'Review CRM entry timeliness for this placement'));
   });
 
@@ -1224,6 +1249,7 @@ function processContract(pl, FX, latestFX, HOL, cutoffDate, missingData){
   nonApprovedPids.forEach(pid=>{ ownedDays[pid] = placementDays[pid] || new Set(); overlapDaysRemoved[pid] = 0; });
 
   const monthlyRows = [];
+  const blockRows = [];
   const results = [];
   eligiblePids.forEach(pid=>{
     const m = meta[pid]; const r = m.row;
@@ -1256,83 +1282,117 @@ function processContract(pl, FX, latestFX, HOL, cutoffDate, missingData){
         'Contract revenue set to £0', 'Provide valid Unit Type'));
     }
 
-    // Contract Forward Sales Revenue rule: an approved, attributed contract that has
-    // started (Start Date on or before the reporting cutoff) has its FULL scheduled
-    // margin (calcStart through Scheduled End Date, unchanged) counted once as Contract
-    // Forward Sales Revenue - it is no longer split month-by-month around the cutoff.
-    // A contract that has not yet started keeps its full scheduled margin in Future
-    // Contract Margin until a later cutoff passes the Start Date.
-    const contractStarted = !!r._startDate && r._startDate <= cutoffDate;
-
-    // Contract FX rule: since the full contract value is now counted once rather than
-    // recognised month by month, it is converted using ONE rate - the FX rate for the
-    // month the contract's Start Date falls in - applied to the whole scheduled margin.
-    // This avoids needing a published rate for every month a multi-year contract might
-    // run through, and avoids silently excluding value just because a later calendar
-    // month's rate hasn't been entered yet. The monthly working-day breakdown below is
-    // retained for audit visibility only; it no longer drives separate per-month FX.
-    const byMonthDays = {};
-    own.forEach(dk=>{
-      const d = dateFromKey(dk);
-      const ym = `${d.getUTCFullYear()}-${d.getUTCMonth()+1}`;
-      byMonthDays[ym] = (byMonthDays[ym]||0)+1;
-    });
-    const totalOriginal = own.size * perDayRate;
-
+    // Contract Forward Sales is recognised in consecutive six-month blocks anchored
+    // to the candidate Start Date. A block becomes recognised on its own start date;
+    // later blocks remain Future Estimated Forward Sales until their start date arrives.
+    // Each EUR/USD block uses the FX rate from the first month of THAT block.
     const revenueApplies = approved && r._attributed;
-    let actualGBP=0, futureGBP=0, fxSource=null, fxRateUsed=null;
+    const totalOriginal = own.size * perDayRate;
+    const blocks = [];
+    let actualGBP=0, futureGBP=0, blockNo=1, blockStart=new Date(r._startDate);
 
-    if(revenueApplies && r._startDate){
-      const sy = r._startDate.getUTCFullYear(), sm = r._startDate.getUTCMonth()+1;
-      let rate = fxRate(FX, sy, sm, ccy);
-      const startMonthLabel = `${sy}-${String(sm).padStart(2,'0')}`;
-      if(rate===null){
-        // Start Date month's rate isn't published yet - use the latest available rate
-        // rather than leaving the whole contract unconverted, and flag it as an estimate.
-        const fb = latestFXFor(latestFX, ccy);
-        if(fb){
-          rate = fb.rate;
-          fxSource = `Latest FX at cutoff (${fb.year}-${String(fb.month).padStart(2,'0')}, estimated - Start Date month ${startMonthLabel} not yet published)`;
-          missingData.push(mkFlag('Information','Placements', pid, '', r._canonCompany,
-            'Contract Start Date month FX not yet published - used latest available rate', `FX Rates ${startMonthLabel} ${ccy}`,
-            `${ccy} ${totalOriginal.toFixed(2)} converted using the latest available FX rate (${rate}, from ${fb.year}-${String(fb.month).padStart(2,'0')}) since ${startMonthLabel}'s rate does not exist yet`,
-            'No action needed - will use the Start Date month rate once it becomes available'));
+    while(blockStart <= r._schedEnd && blockNo < 1000){
+      const nextBlockStart = addMonthsClamped(r._startDate, blockNo*6);
+      const blockEnd = nextBlockStart > r._schedEnd ? r._schedEnd : addDays(nextBlockStart,-1);
+      const startKey = dateKey(blockStart), endKey = dateKey(blockEnd);
+      const blockFullKeys = [...full].filter(dk=>dk>=startKey && dk<=endKey);
+      const blockOwnKeys = [...own].filter(dk=>dk>=startKey && dk<=endKey);
+      const blockRawWeekdays = rawWeekdayCount(blockStart,blockEnd);
+      const blockHolidaysRemoved = blockRawWeekdays-blockFullKeys.length;
+      const blockOverlapDaysRemoved = blockFullKeys.length-blockOwnKeys.length;
+      const originalMargin = blockOwnKeys.length*perDayRate;
+      const recognised = blockStart <= cutoffDate;
+      const sy=blockStart.getUTCFullYear(), sm=blockStart.getUTCMonth()+1;
+      const fxMonth = `${sy}-${String(sm).padStart(2,'0')}`;
+      let rate=null, fxSource='Not evaluated - excluded placement', fxStatus='Not evaluated', gbpValue=0;
+
+      if(revenueApplies){
+        rate = fxRate(FX,sy,sm,ccy);
+        if(rate!==null){
+          fxStatus = ccy==='GBP' ? 'Not required' : 'Actual';
+          fxSource = ccy==='GBP' ? 'GBP - no conversion needed' : `Block ${blockNo} start-month FX (${fxMonth})`;
+        } else if(!recognised){
+          const fb = latestFXFor(latestFX,ccy);
+          if(fb){
+            rate=fb.rate;
+            fxStatus='Estimated';
+            fxSource=`Latest FX at reporting cutoff (${fb.year}-${String(fb.month).padStart(2,'0')}, estimated; block month ${fxMonth} not yet available)`;
+            missingData.push(mkFlag('Information','Placements',pid,r['Candidate']||'',r._canonCompany,
+              `Future Block ${blockNo} estimated using latest available FX at cutoff`,`FX Rates ${fxMonth} ${ccy}`,
+              `${ccy} ${originalMargin.toFixed(2)} converted using ${rate} from ${fb.year}-${String(fb.month).padStart(2,'0')} until ${fxMonth}'s actual rate is supplied`,
+              'No action needed - the block will automatically use its actual start-month FX once uploaded'));
+          } else {
+            fxStatus='Missing';
+            fxSource='Missing - no fallback FX has ever been supplied';
+            missingData.push(mkFlag('Critical','Placements',pid,r['Candidate']||'',r._canonCompany,
+              `Missing FX for Future Block ${blockNo} and no fallback available`,`FX Rates ${fxMonth} ${ccy}`,
+              `${ccy} ${originalMargin.toFixed(2)} cannot be converted to estimated GBP value`,
+              'Provide at least one FX rate for this currency'));
+          }
         } else {
-          missingData.push(mkFlag('Critical','Placements', pid, '', r._canonCompany, 'Missing FX rate for contract Start Date month',
-            `FX Rates ${startMonthLabel} ${ccy}`, `${ccy} ${totalOriginal.toFixed(2)} excluded from confirmed GBP Forward Sales Revenue`, 'Provide FX rate for the Start Date month'));
-          fxSource = 'Missing';
+          fxStatus='Missing';
+          fxSource=`Missing actual block start-month FX (${fxMonth})`;
+          missingData.push(mkFlag('Critical','Placements',pid,r['Candidate']||'',r._canonCompany,
+            `Missing FX rate for recognised Contract Block ${blockNo}`,`FX Rates ${fxMonth} ${ccy}`,
+            `${ccy} ${originalMargin.toFixed(2)} excluded from recognised GBP Forward Sales Revenue`,
+            `Provide the ${fxMonth} FX rate`));
         }
-      } else {
-        fxSource = ccy==='GBP' ? 'GBP - no conversion needed' : `Start Date month FX (${startMonthLabel}), applied to full contract value`;
+        if(rate!==null) gbpValue=round2(originalMargin*rate);
       }
-      if(rate!==null){
-        const gbpTotal = round2(totalOriginal * rate);
-        fxRateUsed = rate;
-        if(contractStarted) actualGBP = gbpTotal; else futureGBP = gbpTotal;
+
+      if(revenueApplies && rate!==null){
+        if(recognised) actualGBP+=gbpValue; else futureGBP+=gbpValue;
       }
+
+      const block = {
+        PlacementID:pid, CanonicalCompany:r._canonCompany, Candidate:r['Candidate'],
+        BlockNumber:blockNo, BlockStartDate:startKey, BlockEndDate:endKey,
+        RawWeekdays:blockRawWeekdays, EligibleWorkingDays:blockOwnKeys.length,
+        HolidaysRemoved:blockHolidaysRemoved, OverlapDaysRemoved:blockOverlapDaysRemoved,
+        DailyMargin:round2(perDayRate), OriginalCurrencyMargin:round2(originalMargin), Currency:ccy,
+        FXMonth:fxMonth, FXRate:rate, FXStatus:fxStatus, FXSource:fxSource,
+        RecognitionStatus:revenueApplies ? (recognised?'Recognised':'Future Estimated') : 'Excluded',
+        GBPValue:revenueApplies&&rate!==null?gbpValue:0,
+        RevenueEligible:revenueApplies, ScheduledEndDate:dateKey(r._schedEnd)
+      };
+      blocks.push(block);
+      blockRows.push(block);
+
+      const byMonthDays={};
+      blockOwnKeys.forEach(dk=>{
+        const d=dateFromKey(dk);
+        const ym=`${d.getUTCFullYear()}-${d.getUTCMonth()+1}`;
+        byMonthDays[ym]=(byMonthDays[ym]||0)+1;
+      });
+      Object.entries(byMonthDays).sort().forEach(([ym,days])=>{
+        const [y,mo]=ym.split('-').map(Number);
+        const amtOriginal=days*perDayRate;
+        monthlyRows.push({PlacementID:pid,CanonicalCompany:r._canonCompany,Candidate:r['Candidate'],Month:`${y}-${String(mo).padStart(2,'0')}`,
+          BlockNumber:blockNo,BlockStartDate:startKey,BlockEndDate:endKey,EligibleWorkingDays:days,
+          DailyMargin:round2(perDayRate),OriginalCurrencyRevenue:round2(amtOriginal),Currency:ccy,
+          MonthlyFXRate:rate,GBPRevenue:revenueApplies&&rate!==null?round2(amtOriginal*rate):0,
+          ActualOrFuture:revenueApplies?(recognised?'Actual':'Future'):'Excluded',FXSource:fxSource});
+      });
+
+      blockStart=nextBlockStart;
+      blockNo++;
     }
 
-    Object.entries(byMonthDays).sort().forEach(([ym,days])=>{
-      const [y,mo] = ym.split('-').map(Number);
-      const amtOriginal = days*perDayRate;
-      monthlyRows.push({ PlacementID:pid, CanonicalCompany:r._canonCompany, Candidate:r['Candidate'], Month:`${y}-${String(mo).padStart(2,'0')}`,
-        EligibleWorkingDays:days, DailyMargin:round2(perDayRate), OriginalCurrencyRevenue:round2(amtOriginal), Currency:ccy,
-        MonthlyFXRate:fxRateUsed, GBPRevenue: revenueApplies ? round2(amtOriginal*(fxRateUsed||0)) : 0, ActualOrFuture: contractStarted?'Actual':'Future',
-        FXSource: fxSource || 'Missing' });
-    });
-
-    results.push({ row:r, actualGBP:round2(actualGBP), futureGBP:round2(futureGBP), calcStatus: actualGBP>0||futureGBP>0 ? 'Calculated' : (approved && r._attributed ? 'Calculated - £0' : 'Excluded'),
-      calcStart: m.calcStart, calcEndActual: m.calcEndActual, scheduledWorkingDays: m.scheduledWorkingDays, holidaysRemoved: m.holidaysRemoved,
-      overlapDaysRemoved: overlapDaysRemoved[pid]||0, unitType: unit, hoursPerDay, fxSource, fxRateUsed, currency: ccy });
+    results.push({row:r,actualGBP:round2(actualGBP),futureGBP:round2(futureGBP),
+      calcStatus:actualGBP>0||futureGBP>0?'Calculated in 6-month blocks':(revenueApplies?'Calculated - £0':'Excluded'),
+      calcStart:m.calcStart,calcEndActual:m.calcEndActual,scheduledWorkingDays:m.scheduledWorkingDays,
+      ownedWorkingDays:own.size,holidaysRemoved:m.holidaysRemoved,overlapDaysRemoved:overlapDaysRemoved[pid]||0,
+      unitType:unit,hoursPerDay,fxSource:blocks.length?`Block-level FX (${blocks.length} block${blocks.length===1?'':'s'})`:null,
+      fxRateUsed:null,currency:ccy,originalAmount:round2(totalOriginal),blocks});
   });
 
   Object.entries(meta).filter(([pid,m])=>!m.eligible).forEach(([pid,m])=>{
     results.push({ row:m.row, actualGBP:0, futureGBP:0, calcStatus:'Excluded - '+m.reasons.join('; '), calcStart:null, calcEndActual:null,
       scheduledWorkingDays:null, holidaysRemoved:null, overlapDaysRemoved:null, unitType:m.row['Unit Type'], hoursPerDay:null,
-      fxSource:null, fxRateUsed:null, currency:m.row['Currency']||null });
+      fxSource:null, fxRateUsed:null, currency:m.row['Currency']||null, originalAmount:null, ownedWorkingDays:null, blocks:[] });
   });
 
-  return { results, monthlyRows };
+  return { results, monthlyRows, blockRows };
 }
 
 
@@ -1377,7 +1437,7 @@ function runRawEngine(buffers, cutoffOverrideStr){
 
   const plBase = processPlacementsBase(rawPlacements, canon, companyStatus, firstEvent, cutoffDate, missingData);
   const permResults = processPermanent(plBase, FX, latestFX, cutoffDate, missingData);
-  const { results: contResults, monthlyRows } = processContract(plBase, FX, latestFX, HOL, cutoffDate, missingData);
+  const { results: contResults, monthlyRows, blockRows } = processContract(plBase, FX, latestFX, HOL, cutoffDate, missingData);
 
   // ---- build placementAudit sheet-shape ----
   const placementAudit = [];
@@ -1395,7 +1455,10 @@ function runRawEngine(buffers, cutoffOverrideStr){
       EmploymentType:'Contract', Status:r['Status'], PlacementDateAdded:dateKey(r._dateAdded), FirstEventDate:dateKey(r._firstEventDate),
       AttributedToEvent: r._attributed ? 'Yes':'No', PlacementStartDate:dateKey(r._startDate), ScheduledEndDate:dateKey(r._schedEnd),
       GBPActualRevenue:a.actualGBP, GBPFutureRevenue:a.futureGBP, CalculationStatus:a.calcStatus, Currency:r['Currency'],
-      UnitType:a.unitType, HoursPerDay:a.hoursPerDay, FXSource:a.fxSource||null, FXRateUsed:a.fxRateUsed!=null?a.fxRateUsed:null });
+      UnitType:a.unitType, HoursPerDay:a.hoursPerDay, FXSource:a.fxSource||null, FXRateUsed:a.fxRateUsed!=null?a.fxRateUsed:null,
+      OriginalCurrencyAmount:a.originalAmount!=null?a.originalAmount:null, ScheduledWorkingDays:a.scheduledWorkingDays,
+      OwnedWorkingDays:a.ownedWorkingDays, HolidaysRemoved:a.holidaysRemoved, OverlapDaysRemoved:a.overlapDaysRemoved,
+      ContractBlocks:a.blocks||[] });
   });
 
   // ---- jobsAudit sheet-shape ----
@@ -1489,7 +1552,7 @@ function runRawEngine(buffers, cutoffOverrideStr){
   const permByYear = {};
   permResults.forEach(a=>{ if(a.actualGBP>0 && a.row._startDate){ const y=a.row._startDate.getUTCFullYear(); permByYear[y]=(permByYear[y]||0)+a.actualGBP; } });
   const contByYear = {};
-  monthlyRows.forEach(mr=>{ if(mr.ActualOrFuture==='Actual' && mr.GBPRevenue){ const y=parseInt(mr.Month.slice(0,4)); contByYear[y]=(contByYear[y]||0)+mr.GBPRevenue; } });
+  blockRows.forEach(br=>{ if(br.RecognitionStatus==='Recognised' && br.RevenueEligible && br.GBPValue){ const y=parseInt(br.BlockStartDate.slice(0,4)); contByYear[y]=(contByYear[y]||0)+br.GBPValue; } });
   const years = [...new Set([...Object.keys(permByYear), ...Object.keys(contByYear)])].map(Number).sort();
   const revenueByYearRaw = years.map(y=>{
     const p = round2(permByYear[y]||0), c = round2(contByYear[y]||0);
@@ -1517,7 +1580,7 @@ function runRawEngine(buffers, cutoffOverrideStr){
   const sheets = {
     calcSummary: [], mappingValidation, revenueByYearRaw, placementAudit, jobsAudit, eventAttrRaw,
     lateCRM, unmappedCompanies, missingData, acceptanceTests: [], termsPostEvent, placeholderRows,
-    attendance, activity, monthlyRows,
+    attendance, activity, monthlyRows, contractBlocks:blockRows,
     cutoffDate: dateKey(cutoffDate), calculationSource: '(computed live from source files)',
   };
   return aggregateForDashboard(sheets);
@@ -1775,6 +1838,7 @@ let DATA = null;
 
 const STATE = { tab:'overview', t2filters:{year:'',event:'',company:'',host:'',format:'',employment:''},
   t2page:1, t2pageSize:12, openEvents:new Set(), openYears:new Set(), t4filters:{severity:'',source:''},
+  blockFilters:{company:'',placement:'',status:'',currency:'',fxStatus:'',check:''},
   activityFrom:'', activityTo:'' };
 
 const TABS = [
@@ -1969,9 +2033,10 @@ function renderOverview(main){
     </div>
 
     <div class="kpi-grid">
-      <div class="kpi-card primary"><div class="card-label">Forward Sales Revenue${tip('Calculated from approved event-attributed placements. Permanent value is the placement fee for placements that have started; contract value is the full scheduled contract margin once the contract has started. Not invoiced or cash-received revenue.')}</div><div class="card-value">${fmtGBP0(fst.total)}</div><div class="card-sub">Permanent and contract combined</div></div>
+      <div class="kpi-card primary"><div class="card-label">Forward Sales Revenue${tip('Calculated from approved event-attributed placements. Permanent fees are recognised when the placement starts; contract margin is recognised one six-month block at a time when each block starts. Not invoiced or cash-received revenue.')}</div><div class="card-value">${fmtGBP0(fst.total)}</div><div class="card-sub">Permanent and recognised contract blocks</div></div>
       <div class="kpi-card"><div class="card-label">Permanent Forward Sales Revenue</div><div class="card-value gold">${fmtGBP0(fst.perm)}</div><div class="card-sub">Based on the approved placement fee</div></div>
-      <div class="kpi-card"><div class="card-label">Contract Forward Sales Revenue</div><div class="card-value teal">${fmtGBP0(fst.cont)}</div><div class="card-sub">Based on contract margin earned to date</div></div>
+      <div class="kpi-card"><div class="card-label">Contract Forward Sales Revenue</div><div class="card-value teal">${fmtGBP0(fst.cont)}</div><div class="card-sub">Six-month blocks started by the cutoff</div></div>
+      <div class="kpi-card"><div class="card-label">Future Estimated Forward Sales${tip('Approved event-attributed value not yet recognised: future permanent starts plus contract six-month blocks whose start dates are after the reporting cutoff. Future EUR/USD blocks use the latest available FX at cutoff until their actual block-start month rate is supplied.')}</div><div class="card-value gold">${fmtGBP0(L.TotalScheduledFutureRevenue||0)}</div><div class="card-sub">Not included in recognised Forward Sales Revenue</div></div>
       <div class="kpi-card"><div class="card-label">Placements</div><div class="card-value">${fmtNum(L.ApprovedPlacements)}</div><div class="card-sub">Approved post-event</div></div>
       <div class="kpi-card"><div class="card-label">Jobs released</div><div class="card-value">${fmtNum(L.JobsReleased)}</div><div class="card-sub">After first event</div></div>
       <div class="kpi-card"><div class="card-label">Post-event terms</div><div class="card-value">${fmtNum(L.CompaniesTermsAfterEvents)}</div><div class="card-sub">Signed on or after first event</div></div>
@@ -1984,7 +2049,8 @@ function renderOverview(main){
           <b style="display:block;margin-bottom:6px;font-family:var(--serif);font-size:13.5px;">How to read this</b>
           <p style="margin:4px 0;">Revenue is linked to the year a company first attended one of our events. Any approved placement made after that first event is attributed back to that event year.</p>
           <p style="margin:4px 0;"><b>Permanent revenue</b> shows fees from approved placements that have started.</p>
-          <p style="margin:4px 0 0;"><b>Contract revenue</b> is the full calculated margin of an approved contract placement once the contract has started. Contracts that have not yet started remain in Future Value.</p>
+          <p style="margin:4px 0;"><b>Contract revenue</b> recognises each six-month block when that block starts. Later blocks remain in Future Estimated Forward Sales.</p>
+          <p style="margin:4px 0 0;"><b>Future estimated value</b> is shown separately and never included in the recognised total.</p>
         </div>
         <div style="overflow-x:auto;"><table class="dt">
           <thead><tr><th>First Event Year</th><th class="num">Permanent Forward Sales Revenue</th><th class="num">Contract Forward Sales Revenue</th><th class="num">Total Forward Sales Revenue</th></tr></thead>
@@ -2132,7 +2198,7 @@ function renderEventsTab(main){
   // attributed totals (matching the company's figures shown on the Executive tab), not the
   // combined totals of every event the company happened to attend. Event-level totals include
   // Forward Sales Revenue attributed to OTHER companies whose first event was the same event.
-  let filteredAttendees, filteredPreTerms, filteredPostTerms, filteredPlacements, filteredFSR;
+  let filteredAttendees, filteredPreTerms, filteredPostTerms, filteredPlacements, filteredFSR, filteredFutureFS;
   if(f2.company){
     const c = DATA.companies.find(x=>x.CanonicalCompany===f2.company);
     const firstEventIncluded = !!c && filteredSummaryEvents.some(e=>e.EventName===c.FirstEventName && e.EventDate===c.FirstEventDate);
@@ -2141,12 +2207,14 @@ function renderEventsTab(main){
     filteredPostTerms = (c && firstEventIncluded) ? (c.TermsAfterEvent||0) : 0;
     filteredPlacements = (c && firstEventIncluded) ? (c.ApprovedPlacementsAfterEvent||0) : 0;
     filteredFSR = (c && firstEventIncluded) ? round2(c.ForwardSalesRevenueTotal||0) : 0;
+    filteredFutureFS = (c && firstEventIncluded) ? round2(c.FutureRevenue||0) : 0;
   } else {
     filteredAttendees = sum(filteredSummaryEvents, e=>e.AttendingCompanies||0);
     filteredPreTerms = sum(filteredSummaryEvents, e=>e.PreEventTermsSigned||0);
     filteredPostTerms = sum(filteredSummaryEvents, e=>e.CompaniesSigningTerms||0);
     filteredPlacements = sum(filteredSummaryEvents, e=>e.ApprovedPlacements||0);
     filteredFSR = round2(sum(filteredSummaryEvents, e=>e.ForwardSalesRevenueTotal||0));
+    filteredFutureFS = round2(sum(filteredSummaryEvents, e=>e.FutureRevenue||0));
   }
   main.innerHTML = `
     <h1 class="section-title">Events &amp; Companies</h1>
@@ -2158,13 +2226,14 @@ function renderEventsTab(main){
       <div class="event-summary"><span>Post-event terms</span><b>${filteredPostTerms}</b></div>
       <div class="event-summary"><span>Approved placements</span><b>${filteredPlacements}</b></div>
       <div class="event-summary"><span>Forward Sales Revenue</span><b>${fmtGBP0(filteredFSR)}</b></div>
+      <div class="event-summary"><span>Future Estimated FS</span><b>${fmtGBP0(filteredFutureFS)}</b></div>
     </div>
     <div style="background:var(--amber-tint);border:1.5px solid var(--gold);border-left:5px solid var(--gold-deep);border-radius:8px;padding:16px 20px;margin:16px 0 22px;font-size:13px;color:var(--ink);line-height:1.65;box-shadow:var(--shadow);">
       <b style="display:block;margin-bottom:8px;font-family:var(--serif);font-size:15px;color:var(--gold-deep);">How to read this</b>
       <p style="margin:4px 0;">This tab shows the companies recorded against each event. Pre-event terms are shown at attendee level, while jobs, placements and Forward Sales Revenue follow the platform's first-event attribution rule.</p>
       <p style="margin:4px 0;">Click "View attributed records" to see a detailed company breakdown, including pre and post-event activity, placements and revenue.</p>
-      <p style="margin:4px 0;"><b>Pre-event placements are shown as 0 intentionally to prevent double counting and calculation errors. Only placements that are added after the event are included in the totals.</b></p>
-      <p style="margin:4px 0 0;">Future totals show approved placement value that has not yet been recognised by the reporting cutoff, so it is kept separate from Forward Sales Revenue.</p>
+      <p style="margin:4px 0;"><b>Placements are included only where both Date Added and candidate Start Date are on or after the client's first event. A candidate who started before that event is excluded in full, including later contract blocks.</b></p>
+      <p style="margin:4px 0 0;">Future Estimated FS shows approved future permanent value and contractor six-month blocks that have not started by the reporting cutoff.</p>
     </div>
     <div class="filterbar">
       <div class="filter-group"><label>Event Year</label><select onchange="setT2('year',this.value)"><option value="">All</option>${years.map(y=>opt(y,y,f.year)).join('')}</select></div>
@@ -2314,7 +2383,7 @@ function renderEventCard(e){
       <span class="tag new">First event</span>
       ${companyTermsStatusForEvent(c, e.EventDate, a)}
       ${c.CurrentOutcomeStatus==='No Post-Event Activity'?'<span class="tag none">No post-event activity</span>':''}
-      ${c.FutureRevenue>0?`<span class="tag pending" title="Approved but the contract has not yet started as of the reporting cutoff. Not included in Forward Sales Revenue until it starts.">${fmtGBP0(c.FutureRevenue)} not yet started (excluded)</span>`:''}
+      ${c.FutureRevenue>0?`<span class="tag pending" title="Approved value not yet recognised at the reporting cutoff, including future contract blocks.">${fmtGBP0(c.FutureRevenue)} Future Estimated FS</span>`:''}
       <span class="company-compact-stats">
         Terms before first event: <b>${c.TermsBeforeEvent||0}</b>
         Terms after: <b>${c.TermsAfterEvent}</b>
@@ -2338,7 +2407,7 @@ function renderEventCard(e){
         <span><b>${e.JobsReleased}</b> jobs</span>
         <span><b>${e.ApprovedPlacements}</b> placements</span>
         <span><b>${fmtGBP0(e.ForwardSalesRevenueTotal)}</b> Forward Sales Revenue</span>
-        ${e.FutureRevenue>0?`<span class="tag pending" title="Approved but the contract has not yet started as of the reporting cutoff. Not included in Forward Sales Revenue until it starts.">${fmtGBP0(e.FutureRevenue)} not yet started (excluded)</span>`:''}
+        ${e.FutureRevenue>0?`<span class="tag pending" title="Approved value not yet recognised at the reporting cutoff, including future contract blocks.">${fmtGBP0(e.FutureRevenue)} Future Estimated FS</span>`:''}
       </div>
     </div>
     <div class="event-body">${rows}</div>
@@ -2350,6 +2419,28 @@ function toggleEvent(key){
 }
 
 // ---------------- VIEW RECORDS MODAL ----------------
+function renderContractBlockBreakdown(p){
+  const blocks=p.ContractBlocks||[];
+  if(p.EmploymentType!=='Contract' || !blocks.length) return '';
+  return `<tr><td colspan="11" style="padding:0 10px 14px 38px;background:var(--paper);">
+    <div style="border-left:3px solid var(--teal);padding:10px 12px 4px;">
+      <div style="font-family:var(--serif);font-size:12.5px;font-weight:700;margin-bottom:8px;">Six-month block calculation</div>
+      <div style="overflow-x:auto;"><table class="mini-table">
+        <thead><tr><th>Block</th><th>Dates</th><th>Status</th><th class="num">Owned working days</th><th class="num">Original margin</th><th>FX month / rate</th><th>FX basis</th><th class="num">GBP value</th></tr></thead>
+        <tbody>${blocks.map(b=>`<tr>
+          <td><b>${b.BlockNumber}</b></td>
+          <td>${fmtDateShort(b.BlockStartDate)} – ${fmtDateShort(b.BlockEndDate)}</td>
+          <td><span class="tag ${b.RecognitionStatus==='Recognised'?'new':b.RecognitionStatus==='Future Estimated'?'pending':'none'}">${esc(b.RecognitionStatus)}</span></td>
+          <td class="num">${fmtNum(b.EligibleWorkingDays||0)}</td>
+          <td class="num">${esc(b.Currency||'')} ${Number(b.OriginalCurrencyMargin||0).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+          <td>${esc(b.FXMonth||'—')}${b.FXRate!=null?' · '+Number(b.FXRate).toFixed(4):' · missing'}</td>
+          <td style="font-size:11px;color:var(--muted);">${esc(b.FXStatus||'—')} · ${esc(b.FXSource||'—')}</td>
+          <td class="num"><b>${fmtGBP2(b.GBPValue||0)}</b></td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+  </td></tr>`;
+}
 function viewRecords(companyName){
   const c = DATA.companies.find(x=>x.CanonicalCompany===companyName);
   if(!c) return;
@@ -2367,7 +2458,8 @@ function viewRecords(companyName){
       <div class="card"><div class="card-label">Approved Placements</div><div class="card-value" style="font-size:18px;">${c.ApprovedPlacementsAfterEvent}</div>${c.FirstApprovedPlacementDate?`<div class="card-sub">first ${fmtDateShort(c.FirstApprovedPlacementDate)}, ${c.DaysToPlacement}d after event</div>`:''}</div>
     </div>
     <div class="compare-grid" style="margin-bottom:8px;">
-      <div class="card" style="grid-column:span 2"><div class="card-label">Forward Sales Revenue${tip('Calculated from approved event-attributed placements. Not invoiced or cash-received revenue.')}</div><div class="card-value gold" style="font-size:18px;">${fmtGBP2(c.ForwardSalesRevenueTotal)}</div><div class="card-sub">Permanent ${fmtGBP2(c.ForwardSalesRevenuePermanent)} · Contract ${fmtGBP2(c.ForwardSalesRevenueContract)}${c.FutureRevenue>0?` · <span style="color:var(--muted-2);">+ ${fmtGBP2(c.FutureRevenue)} not yet started, excluded</span>`:''}</div></div>
+      <div class="card"><div class="card-label">Recognised Forward Sales Revenue${tip('Permanent fees whose placements have started plus contract six-month blocks whose block start dates are on or before the reporting cutoff.')}</div><div class="card-value gold" style="font-size:18px;">${fmtGBP2(c.ForwardSalesRevenueTotal)}</div><div class="card-sub">Permanent ${fmtGBP2(c.ForwardSalesRevenuePermanent)} · Contract ${fmtGBP2(c.ForwardSalesRevenueContract)}</div></div>
+      <div class="card"><div class="card-label">Future Estimated Forward Sales</div><div class="card-value teal" style="font-size:18px;">${fmtGBP2(c.FutureRevenue||0)}</div><div class="card-sub">Approved value not yet recognised at the cutoff</div></div>
     </div>
     <div style="font-size:11px;color:var(--muted-2);margin-bottom:16px;">Forward Sales Revenue does not represent invoiced or cash-received revenue.</div>
     <div style="font-size:12px;color:var(--muted);margin-bottom:18px;">
@@ -2377,21 +2469,22 @@ function viewRecords(companyName){
     ${placements.length ? `
     <h2 class="subhead" style="margin-top:0;">Placement-Level Detail</h2>
     <div style="overflow-x:auto;"><table class="dt">
-      <thead><tr><th>Placement</th><th>Candidate</th><th>Type</th><th>Status</th><th>Date Added</th><th>Currency</th><th>FX Source</th><th class="num">FS Revenue so far</th><th class="num">GBP Future (est.)</th><th class="num">Total Forward Sales Revenue</th></tr></thead>
+      <thead><tr><th>Placement</th><th>Candidate</th><th>Type</th><th>Status</th><th>Date Added</th><th>Start Date</th><th>Currency</th><th>Calculation</th><th class="num">Recognised FS</th><th class="num">Future Estimated FS</th><th class="num">Total Scheduled FS</th></tr></thead>
       <tbody>${placements.map(p=>`<tr>
         <td style="font-family:var(--mono);font-size:11px;">${esc(p.PlacementID)}</td>
         <td>${esc(p.Candidate||'')}</td>
         <td>${esc(p.EmploymentType)}</td>
         <td>${esc(p.Status)}</td>
         <td>${fmtDateShort(p.PlacementDateAdded)}</td>
+        <td>${fmtDateShort(p.PlacementStartDate)}</td>
         <td>${esc(p.Currency||'')}</td>
-        <td style="font-size:11px;color:var(--muted);">${esc(p.FXSource||'—')}</td>
+        <td style="font-size:11px;color:var(--muted);">${esc(p.EmploymentType==='Contract'&&p.ContractBlocks&&p.ContractBlocks.length?p.ContractBlocks.length+' six-month block'+(p.ContractBlocks.length===1?'':'s'):(p.FXSource||'—'))}</td>
         <td class="num">${fmtGBP2(p.GBPActualRevenue||0)}</td>
         <td class="num">${fmtGBP2(p.GBPFutureRevenue||0)}</td>
         <td class="num"><b>${fmtGBP2((p.GBPActualRevenue||0)+(p.GBPFutureRevenue||0))}</b></td>
-      </tr>`).join('')}</tbody>
+      </tr>${renderContractBlockBreakdown(p)}`).join('')}</tbody>
     </table></div>
-    <div style="margin-top:10px;font-size:11px;color:var(--muted-2);">"Latest FX at cutoff (estimated)" means the exact month's FX rate wasn't available yet, so the latest published rate at the reporting cutoff was used instead. Future exchange rates are never forecast — the actual monthly rate will be used automatically once it's supplied.</div>
+    <div style="margin-top:10px;font-size:11px;color:var(--muted-2);">For EUR/USD contracts, each block uses the FX rate from its first month. "Estimated" means that future month's rate is not available yet, so the latest rate at the reporting cutoff is used temporarily and replaced automatically once the actual monthly rate is supplied.</div>
     ` : `<div style="font-size:11px;color:var(--muted-2);">No placement-level records for this company.</div>`}
     <div style="margin-top:14px;font-size:11px;color:var(--muted-2);">Full terms- and job-level source records for this company are in the approved Phase 1 audit workbook (Terms Audit and Jobs Audit sheets).</div>
   `;
@@ -2482,9 +2575,123 @@ function computeReconciliationChecks(){
     { label:'Activity-period total (all time) vs placement-level total', a:periodActivityTotal, b:placementAuditTotal },
   ];
 }
+function computeContractBlockChecks(){
+  const contracts=(DATA.placementAudit||[]).filter(p=>p.EmploymentType==='Contract' && (p.ContractBlocks||[]).length);
+  const rows=contracts.map(p=>{
+    const blocks=p.ContractBlocks||[];
+    const workingDays=sum(blocks,b=>b.EligibleWorkingDays||0);
+    const originalTotal=round2(sum(blocks,b=>b.OriginalCurrencyMargin||0));
+    const gbpTotal=round2(sum(blocks,b=>b.GBPValue||0));
+    const expectedGBP=round2((p.GBPActualRevenue||0)+(p.GBPFutureRevenue||0));
+    const datesOK=blocks.every((b,i)=>{
+      if(b.BlockEndDate>b.ScheduledEndDate || b.BlockStartDate>b.BlockEndDate) return false;
+      if(i===0) return b.BlockStartDate===p.PlacementStartDate;
+      return addDays(dateFromKey(blocks[i-1].BlockEndDate),1).getTime()===dateFromKey(b.BlockStartDate).getTime();
+    });
+    const fxOK=blocks.every(b=>{
+      if(!b.RevenueEligible) return true;
+      if(b.Currency==='GBP') return b.FXRate===1 && b.FXStatus==='Not required';
+      if(b.RecognitionStatus==='Recognised') return b.FXStatus==='Actual';
+      return ['Actual','Estimated'].includes(b.FXStatus);
+    });
+    const workingDaysOK=p.OwnedWorkingDays==null || workingDays===Number(p.OwnedWorkingDays);
+    const originalOK=p.OriginalCurrencyAmount==null || Math.abs(originalTotal-Number(p.OriginalCurrencyAmount))<0.02;
+    const valueOK=Math.abs(gbpTotal-expectedGBP)<0.02;
+    return {p,blocks,workingDays,originalTotal,gbpTotal,datesOK,fxOK,workingDaysOK,originalOK,valueOK,
+      ok:datesOK&&fxOK&&workingDaysOK&&originalOK&&valueOK};
+  });
+  const blocks=rows.flatMap(r=>r.blocks.map(b=>({...b,PlacementCheckOK:r.ok})));
+  return {rows,blocks,passed:rows.filter(r=>r.ok).length,failed:rows.filter(r=>!r.ok).length};
+}
+function renderContractBlockChecks(audit){
+  if(!audit.rows.length) return `
+    <h2 class="subhead">Contract 6-Month FS Checks</h2>
+    <div class="compare-card" style="margin-bottom:26px;"><div class="empty-state">No six-month block audit is stored in the current embedded snapshot. Load the current source files to calculate and verify the new block logic.</div></div>`;
+  const f=STATE.blockFilters||{company:'',placement:'',status:'',currency:'',fxStatus:'',check:''};
+  const companies=[...new Set(audit.blocks.map(b=>b.CanonicalCompany).filter(Boolean))].sort();
+  const placements=[...new Map(audit.blocks.map(b=>[String(b.PlacementID),{id:String(b.PlacementID),candidate:b.Candidate||'',company:b.CanonicalCompany||''}])).values()]
+    .sort((a,b)=>a.company.localeCompare(b.company)||a.candidate.localeCompare(b.candidate)||a.id.localeCompare(b.id));
+  const statuses=[...new Set(audit.blocks.map(b=>b.RecognitionStatus).filter(Boolean))].sort();
+  const currencies=[...new Set(audit.blocks.map(b=>b.Currency).filter(Boolean))].sort();
+  const fxStatuses=[...new Set(audit.blocks.map(b=>b.FXStatus).filter(Boolean))].sort();
+  const sel=(value,current)=>String(value)===String(current)?'selected':'';
+  const filteredBlocks=audit.blocks.filter(b=>{
+    if(f.company && b.CanonicalCompany!==f.company) return false;
+    if(f.placement && String(b.PlacementID)!==String(f.placement)) return false;
+    if(f.status && b.RecognitionStatus!==f.status) return false;
+    if(f.currency && b.Currency!==f.currency) return false;
+    if(f.fxStatus && b.FXStatus!==f.fxStatus) return false;
+    if(f.check==='pass' && !b.PlacementCheckOK) return false;
+    if(f.check==='review' && b.PlacementCheckOK) return false;
+    return true;
+  });
+  return `
+    <h2 class="subhead">Contract 6-Month FS Checks${tip('Verifies block boundaries, working-day allocation, original-currency margin, block FX treatment and the recognised + future total for every contract placement.')}</h2>
+    <div class="card-grid" style="margin-bottom:18px;">
+      <div class="card"><div class="card-label">Contract Placements Checked</div><div class="card-value">${audit.rows.length}</div></div>
+      <div class="card"><div class="card-label">Six-Month Blocks</div><div class="card-value gold">${audit.blocks.length}</div></div>
+      <div class="card"><div class="card-label">Checks Passed</div><div class="card-value" style="color:var(--teal)">${audit.passed}</div></div>
+      <div class="card"><div class="card-label">Checks Requiring Review</div><div class="card-value" style="color:${audit.failed?'var(--rust)':'var(--teal)'}">${audit.failed}</div></div>
+    </div>
+    <div class="compare-card" style="margin-bottom:22px;">
+      <div class="compare-head">Placement Reconciliation</div>
+      <div style="overflow-x:auto;max-height:360px;overflow-y:auto;"><table class="dt">
+        <thead><tr><th>Placement</th><th>Company / Candidate</th><th class="num">Blocks</th><th class="num">Working Days</th><th class="num">Original Total</th><th class="num">Recognised + Future</th><th>Boundaries</th><th>FX</th><th>Result</th></tr></thead>
+        <tbody>${audit.rows.map(r=>`<tr>
+          <td style="font-family:var(--mono);font-size:11px;">${esc(r.p.PlacementID)}</td>
+          <td>${esc(r.p.CanonicalCompany||'')}<div style="font-size:10.5px;color:var(--muted);">${esc(r.p.Candidate||'')}</div></td>
+          <td class="num">${r.blocks.length}</td><td class="num">${r.workingDays}</td>
+          <td class="num">${esc(r.p.Currency||'')} ${r.originalTotal.toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+          <td class="num">${fmtGBP2(r.gbpTotal)}</td>
+          <td><span class="sev-badge sev-${r.datesOK&&r.workingDaysOK?'Information':'Critical'}">${r.datesOK&&r.workingDaysOK?'Pass':'Review'}</span></td>
+          <td><span class="sev-badge sev-${r.fxOK?'Information':'Critical'}">${r.fxOK?'Pass':'Review'}</span></td>
+          <td><span class="sev-badge sev-${r.ok?'Information':'Critical'}">${r.ok?'Reconciles':'Review'}</span></td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+    <div style="background:var(--paper);border:1px solid var(--line);border-left:4px solid var(--teal);border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:11.5px;color:var(--muted);">
+      <b style="color:var(--ink);">Working-day rule:</b> Owned Days are Monday–Friday dates inside the block, minus the agreed currency holiday calendar and any days assigned to a newer overlapping placement for the same candidate and company.
+    </div>
+    <div class="filterbar" style="margin-bottom:14px;">
+      <div class="filter-group"><label>Company</label><select onchange="setBlockFilter('company',this.value)">
+        <option value="">All</option>${companies.map(v=>`<option value="${esc(v)}" ${sel(v,f.company)}>${esc(v)}</option>`).join('')}
+      </select></div>
+      <div class="filter-group"><label>Placement / Candidate</label><select onchange="setBlockFilter('placement',this.value)" style="min-width:220px;">
+        <option value="">All</option>${placements.map(p=>`<option value="${esc(p.id)}" ${sel(p.id,f.placement)}>${esc(p.id+' · '+p.candidate)}</option>`).join('')}
+      </select></div>
+      <div class="filter-group"><label>Block Status</label><select onchange="setBlockFilter('status',this.value)">
+        <option value="">All</option>${statuses.map(v=>`<option value="${esc(v)}" ${sel(v,f.status)}>${esc(v)}</option>`).join('')}
+      </select></div>
+      <div class="filter-group"><label>Currency</label><select onchange="setBlockFilter('currency',this.value)">
+        <option value="">All</option>${currencies.map(v=>`<option value="${esc(v)}" ${sel(v,f.currency)}>${esc(v)}</option>`).join('')}
+      </select></div>
+      <div class="filter-group"><label>FX Basis</label><select onchange="setBlockFilter('fxStatus',this.value)">
+        <option value="">All</option>${fxStatuses.map(v=>`<option value="${esc(v)}" ${sel(v,f.fxStatus)}>${esc(v)}</option>`).join('')}
+      </select></div>
+      <div class="filter-group"><label>Placement Check</label><select onchange="setBlockFilter('check',this.value)">
+        <option value="">All</option><option value="pass" ${sel('pass',f.check)}>Pass</option><option value="review" ${sel('review',f.check)}>Review</option>
+      </select></div>
+      <button class="filter-reset" onclick="resetBlockFilters()">Reset block filters</button>
+    </div>
+    <div class="compare-card" style="margin-bottom:26px;">
+      <div class="compare-head">Block-Level Audit · ${filteredBlocks.length} of ${audit.blocks.length} block${audit.blocks.length===1?'':'s'}</div>
+      <div style="overflow-x:auto;max-height:520px;overflow-y:auto;"><table class="dt">
+        <thead><tr><th>Placement</th><th>Block</th><th>Dates</th><th>Status</th><th class="num">Raw Weekdays</th><th class="num">Holidays</th><th class="num">Overlap</th><th class="num">Owned Days</th><th class="num">Original Margin</th><th>FX Month</th><th>FX Basis</th><th class="num">GBP Value</th></tr></thead>
+        <tbody>${filteredBlocks.length?filteredBlocks.map(b=>`<tr>
+          <td style="font-family:var(--mono);font-size:11px;">${esc(b.PlacementID)}</td><td><b>${b.BlockNumber}</b></td>
+          <td>${fmtDateShort(b.BlockStartDate)} – ${fmtDateShort(b.BlockEndDate)}</td><td>${esc(b.RecognitionStatus)}</td>
+          <td class="num">${b.RawWeekdays||0}</td><td class="num">${b.HolidaysRemoved||0}</td><td class="num">${b.OverlapDaysRemoved||0}</td><td class="num">${b.EligibleWorkingDays||0}</td>
+          <td class="num">${esc(b.Currency||'')} ${Number(b.OriginalCurrencyMargin||0).toLocaleString('en-GB',{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+          <td>${esc(b.FXMonth||'—')}${b.FXRate!=null?' · '+Number(b.FXRate).toFixed(4):''}</td>
+          <td style="font-size:11px;color:var(--muted);">${esc(b.FXStatus||'—')}</td><td class="num"><b>${fmtGBP2(b.GBPValue||0)}</b></td>
+        </tr>`).join(''):`<tr><td colspan="12"><div class="empty-state">No contract blocks match these filters.</div></td></tr>`}</tbody>
+      </table></div>
+    </div>`;
+}
 function renderMissingTab(main){
   const v = DATA.validationSummary;
   const recon = computeReconciliationChecks();
+  const contractAudit = computeContractBlockChecks();
   main.innerHTML = `
     <h1 class="section-title">Data Checks</h1>
     <p class="section-desc">Permanent data-quality page. There are currently <b>${v.Critical} Critical</b> errors. Warnings are informational fallbacks, not errors, and are never shown as Critical. Where a future non-GBP contract or permanent value uses the latest available FX rate at the reporting cutoff (because the exact month's rate doesn't exist yet), this is flagged as <b>Information</b>, not Critical — it is expected behaviour, not a data error.</p>
@@ -2493,7 +2700,7 @@ function renderMissingTab(main){
       <div class="card"><div class="card-label">Critical Errors</div><div class="card-value" style="color:${v.Critical>0?'var(--rust)':'var(--teal)'}">${v.Critical}</div></div>
       <div class="card"><div class="card-label">Warnings</div><div class="card-value gold">${v.Warning}</div></div>
       <div class="card"><div class="card-label">Information Notices</div><div class="card-value">${v.Information}</div></div>
-      <div class="card"><div class="card-label">Late CRM Entries${tip('Placements where Start Date precedes Date Added - revenue is still recognised from Start Date.')}</div><div class="card-value">${v.LateCRMEntries}</div></div>
+      <div class="card"><div class="card-label">Late CRM Entries${tip('Placements where Start Date precedes Date Added. Eligible revenue follows Start Date and six-month block-start rules; placements that started before the first event remain excluded.')}</div><div class="card-value">${v.LateCRMEntries}</div></div>
       <div class="card"><div class="card-label">Unmapped Companies</div><div class="card-value">${v.UnmappedCompanies}</div></div>
       <div class="card"><div class="card-label">Placeholder Rows Excluded</div><div class="card-value">${v.PlaceholderRowsExcluded}</div></div>
     </div>
@@ -2509,6 +2716,8 @@ function renderMissingTab(main){
         }).join('')}</tbody>
       </table></div>
     </div>
+
+    ${renderContractBlockChecks(contractAudit)}
 
     <h2 class="subhead">Mapping Validation</h2>
     <div class="compare-card" style="margin-bottom:26px;">
@@ -2542,6 +2751,8 @@ function renderMissingTab(main){
 }
 function setT4(k,v){ STATE.t4filters[k]=v; renderT4Table(); }
 function resetT4(){ STATE.t4filters={severity:'',source:''}; renderTab(); }
+function setBlockFilter(k,v){ STATE.blockFilters[k]=v; renderTab(); }
+function resetBlockFilters(){ STATE.blockFilters={company:'',placement:'',status:'',currency:'',fxStatus:'',check:''}; renderTab(); }
 function renderT4Table(){
   let rows = DATA.missingData.filter(d=>{
     if(STATE.t4filters.severity && d.Severity!==STATE.t4filters.severity) return false;
